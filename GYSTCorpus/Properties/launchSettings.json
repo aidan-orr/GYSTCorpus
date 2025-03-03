@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "GYSTCorpus": {
+      "commandName": "Project",
+      "nativeDebugging": false,
+        "remoteDebugEnabled": false,
+        "environmentVariables": {
+            "CONNECTION_STRING": "DataSource=F:\\OneDrive\\Purdue\\marlene-masters\\outputs\\transcripts.db"
+        }
+    }
+  }
+}
