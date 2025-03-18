@@ -88,6 +88,10 @@ public class TranscriptsContext : DbContext
 			entity.HasIndex(e => e.Word);
 			entity.HasIndex(e => e.VideoId);
 
+			entity.Property(e => e.GermanPos)
+				.HasConversion(p => (int)p, i => (TreeTagger.Wrapper.PartOfSpeech)i)
+				.ValueGeneratedNever();
+
 			entity.HasOne(e => e.Anglicism)
 				.WithMany(a => a.TranscriptAnglicisms)
 				.HasForeignKey(e => e.Word);
@@ -100,12 +104,16 @@ public class TranscriptsContext : DbContext
 
 		builder.Entity<AnglicismContextWindow>(entity =>
 		{
-			entity.HasKey(e => new { e.Anglicism, e.Year, e.Category, e.ContextWord });
+			entity.HasKey(e => new { e.Anglicism, e.Year, e.Category, e.ContextWord, e.GermanPos });
 
 			entity.HasIndex(e => e.Anglicism);
 			entity.HasIndex(e => e.Year);
 			entity.HasIndex(e => e.Category);
 			entity.HasIndex(e => e.ContextWord);
+			entity.HasIndex(e => e.GermanPos);
+
+			entity.Property(e => e.GermanPos)
+				.HasConversion(p => (int)p, i => (TreeTagger.Wrapper.PartOfSpeech)i);
 
 			entity.HasOne(e => e.AnglicismNavigation)
 				.WithMany(a => a.AnglicismContextWindows)
@@ -135,6 +143,8 @@ public class TranscriptsContext : DbContext
 			optionsBuilder.UseSqlite(_connectionString);
 
 			optionsBuilder.UseLazyLoadingProxies(_useLazyLoading);
+
+			optionsBuilder.EnableSensitiveDataLogging();
 		}
 	}
 }

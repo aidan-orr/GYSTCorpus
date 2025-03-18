@@ -3,6 +3,7 @@ using System;
 using GYSTCorpus;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -10,9 +11,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace GYSTCorpus.Migrations
 {
     [DbContext(typeof(TranscriptsContext))]
-    partial class TranscriptsContextModelSnapshot : ModelSnapshot
+    [Migration("20250303063031_TreeTaggerPOS")]
+    partial class TreeTaggerPOS
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

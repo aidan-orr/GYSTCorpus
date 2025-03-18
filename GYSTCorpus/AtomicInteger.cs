@@ -6,7 +6,12 @@ using System.Text;
 using System.Threading.Tasks;
 
 namespace GYSTCorpus;
-public class AtomicInteger(int value)
+
+/// <summary>
+/// A class that wraps an integer and provides methods for atomic operations.
+/// </summary>
+/// <param name="value">The initial value</param>
+public class AtomicInteger(int value) : IEquatable<AtomicInteger>, IEquatable<int>
 {
 	private int _value = value;
 
@@ -24,6 +29,9 @@ public class AtomicInteger(int value)
 	public override string ToString() => _value.ToString();
 	public override bool Equals(object? obj) => obj is AtomicInteger atomicInteger && _value == atomicInteger._value;
 	public override int GetHashCode() => _value.GetHashCode();
+
+	public bool Equals(AtomicInteger? other) => other is not null && _value == other._value;
+	public bool Equals(int other) => _value == other;
 
 	public static bool operator ==(AtomicInteger left, AtomicInteger right) => left._value == right._value;
 	public static bool operator !=(AtomicInteger left, AtomicInteger right) => left._value != right._value;

@@ -11,6 +11,7 @@ public class TranscriptAnglicism
 	public string LangCode { get; set; } = string.Empty;
 	public string Word { get; set; } = string.Empty;
 	public int TranscriptIndex { get; set; }
+	public TreeTagger.Wrapper.PartOfSpeech GermanPos { get; set; }
 
 	public virtual Anglicism Anglicism { get; set; } = default!;
 

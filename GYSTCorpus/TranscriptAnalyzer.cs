@@ -4,6 +4,7 @@ using GYSTCorpus.Database;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Conventions;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion.Internal;
+using Microsoft.IdentityModel.Tokens;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
@@ -15,6 +16,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
+using TreeTagger.Wrapper;
+
+using PartOfSpeech = GYSTCorpus.Database.PartOfSpeech;
 
 namespace GYSTCorpus;
 public static class TranscriptAnalyzer
@@ -69,11 +73,56 @@ public static class TranscriptAnalyzer
 		return words.Keys;
 	}
 
+	public static long CountWords(string connectionString, int maxTasks = 64)
+	{
+		Transcript[] transcripts;
+		using (TranscriptsContext context = new TranscriptsContext(connectionString, false))
+		{
+			transcripts = context.Transcripts.AsNoTracking().ToArray();
+		}
+
+		long count = 0;
+
+		Parallel.ForEach(transcripts, transcript =>
+		{
+			string[] words = transcript.Text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/', '[', ']').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+			Interlocked.Add(ref count, words.Length);
+		});
+
+		return count;
+	}
+
+	private static FrozenDictionary<string, List<(int WordIndex, int TextIndex, TreeTagger.Wrapper.PartOfSpeech GermanPos)>> CreateTranscriptLookupWithPos(string text, CultureInfo culture, out (string Word, TreeTagger.Wrapper.PartOfSpeech GermanPos)[] taggedWords)
+	{
+		Dictionary<string, List<(int WordIndex, int TextIndex, TreeTagger.Wrapper.PartOfSpeech GermanPos)>> lookup = [];
+
+		string lower = text.ToLower(culture);
+		taggedWords = TreeTagger.Wrapper.Invoke.TagPartsOfSpeech(text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/', '[', ']'), culture).ToArray();
+
+		int startIndex = 0;
+		foreach (var (tagged, i) in taggedWords.WithIndex())
+		{
+			if (!lookup.ContainsKey(tagged.Word))
+				lookup[tagged.Word] = [];
+
+			List<(int WordIndex, int TextIndex, TreeTagger.Wrapper.PartOfSpeech GermanPos)> indices = lookup[tagged.Word];
+
+			int index = lower.IndexOf(tagged.Word, startIndex);
+			if (index != -1)
+				startIndex = index + tagged.Word.Length;
+
+			indices.Add((i, index, tagged.GermanPos));
+		}
+
+		return lookup.ToFrozenDictionary();
+	}
+
 	private static FrozenDictionary<string, List<(int WordIndex, int TextIndex)>> CreateTranscriptLookup(string text, CultureInfo info, out string[] words)
 	{
 		Dictionary<string, List<(int WordIndex, int TextIndex)>> lookup = [];
 		text = text.ToLower(info);
-		words = text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+		words = text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/', '[', ']').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
 		foreach (var (word, i) in words.WithIndex())
 		{
@@ -85,6 +134,25 @@ public static class TranscriptAnalyzer
 			int startIndex = indices.Count == 0 ? 0 : indices.Last().TextIndex + word.Length;
 
 			indices.Add((i, text.IndexOf(word, startIndex)));
+		}
+
+		return lookup.ToFrozenDictionary();
+	}
+
+	private static FrozenDictionary<string, List<int>> CreateTranscriptLookupFast(string text, CultureInfo info, out string[] words)
+	{
+		Dictionary<string, List<int>> lookup = [];
+		text = text.ToLower(info);
+		words = text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/', '[', ']').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+		foreach (var (word, i) in words.WithIndex())
+		{
+			if (!lookup.ContainsKey(word))
+				lookup[word] = [];
+
+			List<int> indices = lookup[word];
+
+			indices.Add(i);
 		}
 
 		return lookup.ToFrozenDictionary();
@@ -132,40 +200,189 @@ public static class TranscriptAnalyzer
 		for (int i = 0; i < fullSize; i++)
 		{
 			string word = orderedWords[wordWindowIndices[i]];
-			contextWindows.GetOrAdd(new(targetWord, year, categoryId, word), new AtomicInteger(0)).Increment();
+			contextWindows.GetOrAdd(new(targetWord, year, categoryId, word, TreeTagger.Wrapper.PartOfSpeech.None), new AtomicInteger(0)).Increment();
 		}
 	}
 
-	private static FrozenDictionary<string, List<int>> CreateTranscriptLookupFast(string text, CultureInfo info, out string[] words)
+	private static void AnalyzeWindowTreeTagger(ConcurrentDictionary<AnglicismContextKey, AtomicInteger> contextWindows, int year, int categoryId, (string Word, TreeTagger.Wrapper.PartOfSpeech PartOfSpeech)[] orderedWords, int wordIndex, int windowSize, params ICollection<TreeTagger.Wrapper.PartOfSpeech> allowedParts)
 	{
-		Dictionary<string, List<int>> lookup = [];
-		text = text.ToLower(info);
-		words = text.Replace(' ', '\r', '\n', ':', ',', '.', ';', '?', '!', '=', '/').Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+		const int maxStackWindowSize = 50;
 
-		foreach (var (word, i) in words.WithIndex())
+		Span<int> rightWordIndices = windowSize <= maxStackWindowSize ? stackalloc int[maxStackWindowSize] : new int[maxStackWindowSize];
+		Span<int> leftWordIndices = windowSize <= maxStackWindowSize ? stackalloc int[maxStackWindowSize] : new int[maxStackWindowSize];
+
+		string targetWord = orderedWords[wordIndex].Word;
+
+		int rightExtentCount = 0;
+		for (int rightExtent = wordIndex + 1; rightExtent < orderedWords.Length && rightExtentCount < windowSize; rightExtent++)
 		{
-			if (!lookup.ContainsKey(word))
-				lookup[word] = [];
+			var word = orderedWords[rightExtent];
 
-			List<int> indices = lookup[word];
+			if (word.Word == targetWord)
+				return; // target word is within the context, ignore it
 
-			indices.Add(i);
+			if (allowedParts.Contains(word.PartOfSpeech))
+				rightWordIndices[rightExtentCount++] = rightExtent;
 		}
 
-		return lookup.ToFrozenDictionary();
+		int leftExtentCount = 0;
+		for (int leftExtent = wordIndex - 1; leftExtent >= 0 && leftExtentCount < windowSize; leftExtent--)
+		{
+			var word = orderedWords[leftExtent];
+
+			if (allowedParts.Contains(word.PartOfSpeech))
+				leftWordIndices[leftExtentCount++] = leftExtent;
+		}
+
+		int fullSize = leftExtentCount + rightExtentCount;
+
+		Span<int> wordWindowIndices = fullSize <= 2 * maxStackWindowSize ? stackalloc int[2 * maxStackWindowSize] : new int[fullSize];
+		leftWordIndices[..leftExtentCount].CopyTo(wordWindowIndices);
+		rightWordIndices[..rightExtentCount].CopyTo(wordWindowIndices[leftExtentCount..]);
+
+		for (int i = 0; i < fullSize; i++)
+		{
+			var word = orderedWords[wordWindowIndices[i]];
+			contextWindows.GetOrAdd(new(targetWord, year, categoryId, word.Word, word.PartOfSpeech), new AtomicInteger(0)).Increment();
+		}
+	}
+
+	private readonly record struct VideoInfo(string VideoId, DateTime PublishedAt, int CategoryId);
+
+	/// <summary>
+	/// Analyzes all transcripts in the database for anglicisms and their context words and parts of speech
+	/// </summary>
+	/// <param name="connectionString"></param>
+	/// <param name="maxTasks"></param>
+	public static void AnalyzeWithPartOfSpeech(string connectionString, int maxTasks = 64)
+	{
+		const int windowSize = 50;
+
+		CultureInfo german = CultureInfo.GetCultureInfo("de");
+
+		string[] anglicisms; // List of anglicisms to search for
+		Transcript[] allTranscripts; // All transcripts in the database
+		FrozenDictionary<string, VideoInfo> videoLookup; // Lookup table for videos by video id
+
+		using (TranscriptsContext context = new TranscriptsContext(connectionString, false))
+		{
+			anglicisms = context.Anglicisms.Select(a => a.Word).ToArray();
+
+			allTranscripts = context.Transcripts.Where(t => t.LangCode == "de").Include(t => t.Video).AsNoTracking().ToArray();
+			videoLookup = allTranscripts.DistinctBy(t => t.VideoId).Select(t => new VideoInfo(t.VideoId, t.Video!.PublishedAt, t.Video.CategoryId)).ToFrozenDictionary(t => t.VideoId, t => t);
+		}
+
+		// Concurrent dictionary to store the context window information
+		ConcurrentDictionary<AnglicismContextKey, AtomicInteger> contextWindows = new ConcurrentDictionary<AnglicismContextKey, AtomicInteger>(maxTasks, 128 * 1024 * 1024);
+
+		void Action(Transcript transcript, AtomicInteger processed, ConcurrentQueue<TranscriptAnglicism> transcriptAnglicisms, long index, CancellationToken token)
+		{
+			VideoInfo video = videoLookup[transcript.VideoId];
+			int year = video.PublishedAt.Year;
+			int category = video.CategoryId;
+
+			FrozenDictionary<string, List<(int WordIndex, int TextIndex, TreeTagger.Wrapper.PartOfSpeech PartOfSpeech)>> transcriptLookup = CreateTranscriptLookupWithPos(transcript.Text, german, out (string Word, TreeTagger.Wrapper.PartOfSpeech PartOfSpeech)[] orderedWords);
+
+			int found = 0;
+
+			foreach (string anglicism in anglicisms)
+			{
+				if (transcriptLookup.TryGetValue(anglicism, out List<(int WordIndex, int TextIndex, TreeTagger.Wrapper.PartOfSpeech PartOfSpeech)>? indices) && indices is not null)
+				{
+					foreach (var (wordIndex, textIndex, partOfSpeech) in indices)
+					{
+						AnalyzeWindowTreeTagger(contextWindows, year, category, orderedWords, wordIndex, windowSize, TreeTagger.Wrapper.PartOfSpeechHelpers.TargetPartsOfSpeech);
+
+						TranscriptAnglicism ta = new TranscriptAnglicism
+						{
+							VideoId = transcript.VideoId,
+							LangCode = transcript.LangCode,
+							Word = anglicism,
+							TranscriptIndex = textIndex,
+							GermanPos = partOfSpeech
+						};
+
+						transcriptAnglicisms.Enqueue(ta);
+						found++;
+					}
+				}
+			}
+
+			allTranscripts[index] = null!; // Try to free up memory
+
+			Console.WriteLine($"Found {found} anglicisms in transcript {transcript.VideoId}-{transcript.LangCode} ({processed.Increment()}/{allTranscripts.Length})");
+		}
+
+		// Force full collection before starting
+		GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+
+		ParallelTaskExecutor.ForEachWithSave<Transcript, TranscriptAnglicism>(allTranscripts, Action, (transcriptAnglicisms, cancellation) =>
+		{
+			if (cancellation.IsCancellationRequested)
+				return;
+
+			using TranscriptsContext context = new TranscriptsContext(connectionString, false);
+			while (transcriptAnglicisms.TryDequeue(out TranscriptAnglicism? anglicism) && anglicism is not null)
+			{
+				context.TranscriptAnglicism.Add(anglicism);
+			}
+
+			context.SaveChanges();
+		}, maxTasks: maxTasks);
+
+		AnglicismContextKey[] keys = GC.AllocateUninitializedArray<AnglicismContextKey>(contextWindows.Count);
+		contextWindows.Keys.CopyTo(keys, 0);
+
+		Console.WriteLine($"Saving context windows to database");
+
+		// Force collection before saving to database
+		GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+
+		int toProcess = contextWindows.Count;
+
+		const int chunkSize = 1000 * 1000;
+		int finished = 0;
+
+		BulkConfig bulkConfig = new BulkConfig { BatchSize = 10000 };
+		foreach (var group in contextWindows.Chunk(chunkSize))
+		{
+			using TranscriptsContext context = new TranscriptsContext(connectionString, false);
+
+
+			AnglicismContextWindow[] windows = new AnglicismContextWindow[group.Length];
+
+			Parallel.ForEach(group, (value, _, i) =>
+			{
+				windows[i] = new AnglicismContextWindow
+				{
+					Anglicism = value.Key.Anglicism,
+					Year = value.Key.Year,
+					Category = value.Key.Category,
+					ContextWord = value.Key.ContextWord,
+					GermanPos = value.Key.GermanPos,
+					Count = value.Value
+				};
+			});
+
+			context.BulkInsert(windows, bulkConfig);
+			context.SaveChanges();
+
+			Console.WriteLine($"Finished {Interlocked.Increment(ref finished)} / {Math.Ceiling(contextWindows.Count / (double)chunkSize)} steps");
+		}
 	}
 
 	public static Dictionary<AnglicismContextKey, int> Analyze(string connectionString, int maxTasks = 64)
 	{
 		CultureInfo german = CultureInfo.GetCultureInfo("de");
 
-		string[] anglicisms;
-		Transcript[] allTranscripts;
-		FrozenDictionary<string, Video> videoLookup;
-		FrozenDictionary<string, PartOfSpeech> taggedWords;
+		string[] anglicisms; // List of anglicisms to search for
+		Transcript[] allTranscripts; // All transcripts in the database
+		FrozenDictionary<string, Video> videoLookup; // Lookup table for videos by video id
+		FrozenDictionary<string, PartOfSpeech> taggedWords; // Lookup table for part of speech by word
 
 		HashSet<string> processedVideos = [];
 
+		// Copy all of the data from the database into memory
 		using (TranscriptsContext context = new TranscriptsContext(connectionString, false))
 		{
 			anglicisms = context.Anglicisms.Select(a => a.Word).ToArray();
@@ -178,8 +395,10 @@ public static class TranscriptAnalyzer
 			processedVideos = new HashSet<string>(context.TranscriptAnglicism.AsNoTracking().Select(t => t.VideoId).Distinct().ToArray());
 		}
 
-		ConcurrentDictionary<AnglicismContextKey, AtomicInteger> contextWindows = new ConcurrentDictionary<AnglicismContextKey, AtomicInteger>(maxTasks, 1024 * 1024);
+		// Concurrent dictionary to store the context window information
+		ConcurrentDictionary<AnglicismContextKey, AtomicInteger> contextWindows = new ConcurrentDictionary<AnglicismContextKey, AtomicInteger>(maxTasks, 128 * 1024 * 1024);
 
+		// List of completed video ids, int is just a placeholder
 		ConcurrentDictionary<string, int> completedVideos = [];
 
 		void Action(Transcript transcript, AtomicInteger processed, ConcurrentQueue<TranscriptAnglicism> transcriptAnglicisms, CancellationToken token)
@@ -239,11 +458,11 @@ public static class TranscriptAnalyzer
 
 		ParallelTaskExecutor.ForEachWithSave<Transcript, TranscriptAnglicism>(allTranscripts, Action, (transcriptAnglicisms, _) =>
 		{
-			if (DateTime.UtcNow - lastCollect >= collectInterval)
-			{
-				GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
-				lastCollect = DateTime.UtcNow;
-			}
+			//if (DateTime.UtcNow - lastCollect >= collectInterval)
+			//{
+			//	GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+			//	lastCollect = DateTime.UtcNow;
+			//}
 
 			using TranscriptsContext context = new TranscriptsContext(connectionString, false);
 			while (transcriptAnglicisms.TryDequeue(out TranscriptAnglicism? anglicism) && anglicism is not null)
@@ -389,8 +608,6 @@ public static class TranscriptAnalyzer
 		{
 			using TranscriptsContext context = new TranscriptsContext(connectionString, false);
 
-
-
 			BulkConfig bulkConfig = new BulkConfig { BatchSize = 10000 };
 
 			AnglicismContextWindow[] windows = new AnglicismContextWindow[group.Length];
@@ -522,28 +739,41 @@ public static class TranscriptAnalyzer
 						  orderby g.Count() descending
 						  select g.Key).ToArray();
 
-		var topWords = anglicisms.Take(2000).ToArray();
+		float[,,] entropies = new float[categoryIds.Length, anglicisms.Length * PartOfSpeechHelpers.OutputCategories.Length, years.Length];
+		long[,,] counts = new long[categoryIds.Length, anglicisms.Length * PartOfSpeechHelpers.OutputCategories.Length, years.Length];
 
-		float[,,] entropies = new float[categoryIds.Length, topWords.Length, years.Length];
-
-		Parallel.ForEach(topWords.WithIndex(), word =>
+		Parallel.ForEach(anglicisms.WithIndex(), new ParallelOptions { MaxDegreeOfParallelism = 1 }, word =>
 		{
 			using TranscriptsContext innerContext = new TranscriptsContext(connectionString, false);
 
-			var allWindows = innerContext.AnglicismContextWindows.Where(w => w.Anglicism == word.Value).Select(w => new { w.Count, w.Category, w.Year }).ToArray();
+			var allWindows = innerContext.AnglicismContextWindows.Where(w => w.Anglicism == word.Value).Select(w => new { w.Count, w.Category, w.GermanPos, w.Year }).ToArray();
+
+			var anglicismMatches = innerContext.TranscriptAnglicism
+				.Include(t => t.Transcript)
+				.ThenInclude(t => t.Video)
+				.Where(t => t.Word == word.Value)
+				.Select(t => new { t.Word, t.GermanPos, t.Transcript!.Video!.CategoryId, t.Transcript.Video.PublishedAt })
+				.AsEnumerable()
+				.Select(t => (t.GermanPos, t.CategoryId, t.PublishedAt.Year)).ToArray();
 
 			for (int ci = 0; ci < categoryIds.Length; ci++)
 			{
 				int category = categoryIds[ci];
-				var catWindows = allWindows.Where(w => w.Category == category).Select(w => new { w.Count, w.Year });
+				var catWindows = allWindows.Where(w => w.Category == category).Select(w => (w.Count, w.Year, w.GermanPos));
 
+				var catAnglicisms = anglicismMatches.Where(w => w.CategoryId == category).ToArray();
+
+				int wordStartIndex = word.Index * PartOfSpeechHelpers.OutputCategories.Length;
+
+				// Calculate the overall entropy for all years in a category
 				for (int yi = 0; yi < years.Length; yi++)
 				{
 					int year = years[yi];
 
 					var windows = catWindows.Where(w => w.Year == year).Select(w => w.Count).ToArray();
+					var yearAnglicisms = catAnglicisms.Where(w => w.Year == year).ToArray();
 
-					int total = windows.Sum();
+					long total = windows.Sum(w => (long)w);
 
 					float entropy = 0;
 					foreach (var window in windows)
@@ -552,7 +782,63 @@ public static class TranscriptAnalyzer
 						entropy += p * MathF.Log2(p);
 					}
 
-					entropies[ci, word.Index, yi] = -entropy;
+					entropies[ci, wordStartIndex, yi] = -entropy;
+					counts[ci, wordStartIndex, yi] = yearAnglicisms.Length;
+				}
+
+				// Calculate the entropy for each part of speech
+				for (int posIndex = 1; posIndex <= PartOfSpeechHelpers.CategoryCount; posIndex++)
+				{
+					string pos = PartOfSpeechHelpers.OutputCategories[posIndex];
+
+					var posWindows = catWindows.Where(w => w.GermanPos.ToCategory() == pos).Select(w => (w.Count, w.Year));
+					var posAnglicisms = catAnglicisms.Where(w => w.GermanPos.ToCategory() == pos);
+
+					for (int yi = 0; yi < years.Length; yi++)
+					{
+						int year = years[yi];
+
+						var windows = posWindows.Where(w => w.Year == year).Select(w => w.Count).ToArray();
+						var yearAnglicisms = posAnglicisms.Where(w => w.Year == year).ToArray();
+
+						long total = windows.Sum(w => (long)w);
+
+						float entropy = 0;
+						foreach (var window in windows)
+						{
+							float p = (float)window / total;
+							entropy += p * MathF.Log2(p);
+						}
+
+						entropies[ci, wordStartIndex + posIndex, yi] = -entropy;
+						counts[ci, wordStartIndex + posIndex, yi] = yearAnglicisms.Length;
+					}
+				}
+
+				// Calculate the entropy for other parts of speech
+				{
+					var posWindows = catWindows.Where(w => !w.GermanPos.IsTargetPartOfSpeech()).Select(w => (w.Count, w.Year));
+					var posAnglicisms = catAnglicisms.Where(w => !w.GermanPos.IsTargetPartOfSpeech());
+
+					for (int yi = 0; yi < years.Length; yi++)
+					{
+						int year = years[yi];
+
+						var windows = posWindows.Where(w => w.Year == year).Select(w => w.Count).ToArray();
+						var yearAnglicisms = posAnglicisms.Where(w => w.Year == year).ToArray();
+
+						long total = windows.Sum(w => (long)w);
+
+						float entropy = 0;
+						foreach (var window in windows)
+						{
+							float p = (float)window / total;
+							entropy += p * MathF.Log2(p);
+						}
+
+						entropies[ci, wordStartIndex + PartOfSpeechHelpers.OutputCategories.Length - 1, yi] = -entropy;
+						counts[ci, wordStartIndex + PartOfSpeechHelpers.OutputCategories.Length - 1, yi] = yearAnglicisms.Length;
+					}
 				}
 
 				Console.WriteLine($"Finished entropies for word '{word}', Category {categoryNames[category]}");
@@ -566,21 +852,38 @@ public static class TranscriptAnalyzer
 			int category = categoryIds[ci];
 
 			StringBuilder csvBuilder = new();
-			csvBuilder.Append("Word,").AppendJoin(',', years).AppendLine();
+			csvBuilder.Append("Word,Part of Speech,");
 
-			for (int wi = 0; wi < topWords.Length; wi++)
+			foreach(int year in years)
 			{
-				csvBuilder.Append(topWords[wi]).Append(',');
-				for (int yi = 0; yi < years.Length; yi++)
-				{
-					csvBuilder.Append(entropies[ci, wi, yi]);
-
-					if (yi < years.Length - 1)
-						csvBuilder.Append(',');
-				}
-
-				csvBuilder.AppendLine();
+				csvBuilder.Append(year).Append(" - Entropy,");
+				csvBuilder.Append(year).Append(" - Count,");
 			}
+
+			csvBuilder.AppendLine();
+
+			for (int wi = 0; wi < anglicisms.Length; wi++)
+			{
+				for (int i = 0; i < PartOfSpeechHelpers.OutputCategories.Length; ++i)
+				{
+					csvBuilder.Append(anglicisms[wi]).Append(',');
+					csvBuilder.Append(PartOfSpeechHelpers.OutputCategories[i]).Append(',');
+
+					for (int yi = 0; yi < years.Length; yi++)
+					{
+						csvBuilder.Append(entropies[ci, wi * PartOfSpeechHelpers.OutputCategories.Length + i, yi]).Append(',');
+						csvBuilder.Append(counts[ci, wi * PartOfSpeechHelpers.OutputCategories.Length + i, yi]);
+
+						if (yi < years.Length - 1)
+							csvBuilder.Append(',');
+					}
+					
+					csvBuilder.AppendLine();
+				}
+			}
+
+			if (!Directory.Exists(Path.Join(outputDir, "categories")))
+				Directory.CreateDirectory(Path.Join(outputDir, "categories"));
 
 			File.WriteAllText(Path.Join(outputDir, "categories", $"{categoryNames[category]}.csv"), csvBuilder.ToString());
 		}
